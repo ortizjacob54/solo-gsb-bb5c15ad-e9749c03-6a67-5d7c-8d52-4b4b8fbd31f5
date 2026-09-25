@@ -281,3 +281,56 @@ class PhaseFaultRehearsalResult(BaseModel):
     disconnected_power: int = Field(..., ge=0, description="断开设备的总功率")
     disconnected_count: int = Field(..., ge=0, description="断开设备数")
     message: str
+
+
+class DeviceAdditionRequest(BaseModel):
+    """新设备接入预演请求体（仅预演，不修改历史计算记录）。"""
+
+    devices: list[DeviceIn] = Field(
+        ..., min_length=1, max_length=12, description="待接入的新设备列表，1~12 台"
+    )
+
+    @model_validator(mode="after")
+    def _unique_device_ids(self) -> "DeviceAdditionRequest":
+        ids = [d.id for d in self.devices]
+        if len(ids) != len(set(ids)):
+            raise ValueError("设备编号必须唯一")
+        return self
+
+
+class DeviceMigrationItem(BaseModel):
+    """一台原设备的改相结果（原相位与新相位不同）。"""
+
+    device_id: str
+    power: int = Field(..., description="设备功率（正整数）")
+    from_phase: Phase = Field(..., description="原接入相位")
+    to_phase: Phase = Field(..., description="新接入相位")
+
+
+class DeviceAdditionPlanResult(BaseModel):
+    """新设备接入预演结果（原计算记录不做任何修改）。"""
+
+    id: int
+    created_at: str
+    capacities: Loads = Field(..., description="各相容量（沿用原计算记录）")
+    feasible: bool = Field(..., description="是否存在全部设备均接入且不超容量的方案")
+    migrated_count: Optional[int] = Field(
+        None, description="原设备改相台数（新相位与原相位不同的原设备数）"
+    )
+    imbalance: Optional[int] = Field(
+        None, description="接入后三相负载最大值与最小值之差"
+    )
+    assignments: list[AssignmentItem] = Field(
+        ..., description="全部新旧设备的最终分配（按设备编号排序）；无解时为空"
+    )
+    original_assignments: list[AssignmentItem] = Field(
+        ..., description="原设备的最终分配（按设备编号排序）；无解时为空"
+    )
+    added_assignments: list[AssignmentItem] = Field(
+        ..., description="新设备的最终分配（按设备编号排序）；无解时为空"
+    )
+    migrations: list[DeviceMigrationItem] = Field(
+        ..., description="改相的原设备清单（按设备编号排序）；无解时为空"
+    )
+    loads: Optional[Loads] = Field(None, description="接入后各相负载")
+    message: str

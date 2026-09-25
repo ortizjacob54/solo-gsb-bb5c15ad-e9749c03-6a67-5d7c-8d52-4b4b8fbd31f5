@@ -766,3 +766,266 @@ def test_phase_fault_rehearsal_does_not_modify_record():
         params={"fault_phase": "A"},
     ).json()
     assert again == first
+
+
+# ---------------------------------------------------------------------------
+# 新设备接入预演
+# ---------------------------------------------------------------------------
+
+ADDITION_PAYLOAD = {
+    "capacities": {"A": 10, "B": 10, "C": 10},
+    "devices": [
+        {"id": "O1", "power": 8, "allowed_phases": ["A"]},
+        {"id": "O2", "power": 2, "allowed_phases": ["A", "B", "C"]},
+    ],
+}
+
+
+def _addition_body(new_devices):
+    return {"devices": new_devices}
+
+
+def test_device_addition_plan_success_zero_moves():
+    created = _create(ADDITION_PAYLOAD)
+    calc_id = created["id"]
+    assert created["feasible"] is True
+    # 原记录最优：O1->A(8)、O2->B(2)
+    assert created["loads"] == {"A": 8, "B": 2, "C": 0}
+
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/device-addition-plan",
+        json=_addition_body(
+            [{"id": "N1", "power": 2, "allowed_phases": ["A", "B", "C"]}]
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == calc_id
+    assert body["capacities"] == {"A": 10, "B": 10, "C": 10}
+    assert body["feasible"] is True
+    # 0 改相可行（N1->C，差 6）；改相虽可得到更小差值，改相台数优先
+    assert body["migrated_count"] == 0
+    assert body["imbalance"] == 6
+    assert body["loads"] == {"A": 8, "B": 2, "C": 2}
+    # 全部设备最终分配按编号排序
+    assert body["assignments"] == [
+        {"device_id": "N1", "phase": "C"},
+        {"device_id": "O1", "phase": "A"},
+        {"device_id": "O2", "phase": "B"},
+    ]
+    assert body["original_assignments"] == [
+        {"device_id": "O1", "phase": "A"},
+        {"device_id": "O2", "phase": "B"},
+    ]
+    assert body["added_assignments"] == [{"device_id": "N1", "phase": "C"}]
+    assert body["migrations"] == []
+    assert "预演" in body["message"]
+    for phase in ("A", "B", "C"):
+        assert body["loads"][phase] <= body["capacities"][phase]
+
+
+def test_device_addition_plan_with_migrations():
+    # N1 只能接 A 且 0 改相时 A 超载（8+3>10），恰须一台原设备改相
+    created = _create({
+        "capacities": {"A": 10, "B": 10, "C": 10},
+        "devices": [
+            {"id": "O1", "power": 8, "allowed_phases": ["A", "B"]},
+            {"id": "O2", "power": 2, "allowed_phases": ["A", "B", "C"]},
+        ],
+    })
+    assert created["feasible"] is True
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/device-addition-plan",
+        json=_addition_body(
+            [{"id": "N1", "power": 3, "allowed_phases": ["A"]}]
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feasible"] is True
+    assert body["migrated_count"] == 1
+    # O1->B（序列 (B,B,A)）与 O2->C（序列 (A,C,A)）差值相同，字典序取前者
+    assert body["migrations"] == [
+        {"device_id": "O1", "power": 8, "from_phase": "A", "to_phase": "B"}
+    ]
+    assert body["loads"] == {"A": 3, "B": 10, "C": 0}
+    assert body["imbalance"] == 10
+
+
+def test_device_addition_plan_infeasible():
+    created = _create({
+        "capacities": {"A": 10, "B": 10, "C": 10},
+        "devices": [{"id": "O1", "power": 9, "allowed_phases": ["A"]}],
+    })
+    assert created["feasible"] is True
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/device-addition-plan",
+        json=_addition_body(
+            [{"id": "N1", "power": 2, "allowed_phases": ["A"]}]
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feasible"] is False
+    assert body["migrated_count"] is None
+    assert body["imbalance"] is None
+    assert body["loads"] is None
+    assert body["assignments"] == []
+    assert body["original_assignments"] == []
+    assert body["added_assignments"] == []
+    assert body["migrations"] == []
+    assert "无可行" in body["message"]
+
+
+def test_device_addition_plan_404():
+    resp = client.post(
+        "/api/v1/calculations/999999/device-addition-plan",
+        json=_addition_body(
+            [{"id": "N1", "power": 1, "allowed_phases": ["A"]}]
+        ),
+    )
+    assert resp.status_code == 404
+
+
+def test_device_addition_plan_409_when_infeasible():
+    created = _create(INFEASIBLE_UPGRADE_PAYLOAD)
+    assert created["feasible"] is False
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/device-addition-plan",
+        json=_addition_body(
+            [{"id": "N1", "power": 1, "allowed_phases": ["A"]}]
+        ),
+    )
+    assert resp.status_code == 409
+
+
+def test_device_addition_plan_validation_duplicate_with_record():
+    created = _create(ADDITION_PAYLOAD)
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/device-addition-plan",
+        json=_addition_body(
+            [{"id": "O1", "power": 1, "allowed_phases": ["A"]}]
+        ),
+    )
+    assert resp.status_code == 422
+    assert "重复" in resp.json()["detail"]
+
+
+def test_device_addition_plan_validation_total_exceeds_twelve():
+    devices = [
+        {"id": f"O{i}", "power": 1, "allowed_phases": ["A", "B", "C"]}
+        for i in range(10)
+    ]
+    created = _create({
+        "capacities": {"A": 1000, "B": 1000, "C": 1000},
+        "devices": devices,
+    })
+    assert created["feasible"] is True
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/device-addition-plan",
+        json=_addition_body([
+            {"id": "N1", "power": 1, "allowed_phases": ["A"]},
+            {"id": "N2", "power": 1, "allowed_phases": ["A"]},
+            {"id": "N3", "power": 1, "allowed_phases": ["A"]},
+        ]),
+    )
+    assert resp.status_code == 422
+    assert "12" in resp.json()["detail"]
+
+
+def test_device_addition_plan_validation_duplicate_new_ids():
+    created = _create(ADDITION_PAYLOAD)
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/device-addition-plan",
+        json=_addition_body([
+            {"id": "N1", "power": 1, "allowed_phases": ["A"]},
+            {"id": "N1", "power": 2, "allowed_phases": ["B"]},
+        ]),
+    )
+    assert resp.status_code == 422
+
+
+def test_device_addition_plan_validation_empty_and_bad_device():
+    created = _create(ADDITION_PAYLOAD)
+    # 空新设备列表：422
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/device-addition-plan",
+        json={"devices": []},
+    )
+    assert resp.status_code == 422
+    # 非正功率 / 空允许相位 / 非法相位：422
+    for bad_device in (
+        {"id": "N1", "power": 0, "allowed_phases": ["A"]},
+        {"id": "N1", "power": 1, "allowed_phases": []},
+        {"id": "N1", "power": 1, "allowed_phases": ["X"]},
+    ):
+        resp = client.post(
+            f"/api/v1/calculations/{created['id']}/device-addition-plan",
+            json=_addition_body([bad_device]),
+        )
+        assert resp.status_code == 422
+
+
+def test_device_addition_plan_exactly_twelve_devices_ok():
+    # 原 11 台 + 新 1 台恰好 12 台：通过总数校验并正常求解
+    devices = [
+        {"id": f"O{i:02d}", "power": 1, "allowed_phases": ["A", "B", "C"]}
+        for i in range(11)
+    ]
+    created = _create({
+        "capacities": {"A": 100, "B": 100, "C": 100},
+        "devices": devices,
+    })
+    assert created["feasible"] is True
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/device-addition-plan",
+        json=_addition_body(
+            [{"id": "N1", "power": 1, "allowed_phases": ["A", "B", "C"]}]
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feasible"] is True
+    assert len(body["assignments"]) == 12
+    assert len(body["added_assignments"]) == 1
+    assert len(body["original_assignments"]) == 11
+
+
+def test_device_addition_plan_does_not_modify_record():
+    created = _create(ADDITION_PAYLOAD)
+    calc_id = created["id"]
+    before = client.get(f"/api/v1/calculations/{calc_id}").json()
+    count_before = len(client.get("/api/v1/calculations").json())
+
+    # 可行预演
+    client.post(
+        f"/api/v1/calculations/{calc_id}/device-addition-plan",
+        json=_addition_body(
+            [{"id": "N1", "power": 2, "allowed_phases": ["A", "B", "C"]}]
+        ),
+    )
+    # 不可行预演同样不得改历史
+    client.post(
+        f"/api/v1/calculations/{calc_id}/device-addition-plan",
+        json=_addition_body([
+            {"id": "X1", "power": 20, "allowed_phases": ["A"]},
+            {"id": "X2", "power": 20, "allowed_phases": ["B"]},
+            {"id": "X3", "power": 20, "allowed_phases": ["C"]},
+        ]),
+    )
+
+    after = client.get(f"/api/v1/calculations/{calc_id}").json()
+    assert after == before
+    assert len(client.get("/api/v1/calculations").json()) == count_before
+
+    # 同一请求重复预演结果确定且相同（幂等读操作）
+    payload = _addition_body(
+        [{"id": "N1", "power": 2, "allowed_phases": ["A", "B", "C"]}]
+    )
+    first = client.post(
+        f"/api/v1/calculations/{calc_id}/device-addition-plan", json=payload
+    ).json()
+    again = client.post(
+        f"/api/v1/calculations/{calc_id}/device-addition-plan", json=payload
+    ).json()
+    assert again == first

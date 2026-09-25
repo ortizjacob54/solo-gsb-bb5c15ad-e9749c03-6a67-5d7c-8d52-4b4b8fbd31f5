@@ -52,6 +52,15 @@
 展开，故完整方案按选择序列字典序依次产生，仅在 (保留功率, 保留设备数)
 严格更优时更新，同值自然保留字典序最小方案；并以剩余设备功率和 / 数量和
 做乐观上界剪枝。
+
+新设备接入预演（solve_device_addition_plan）：给定一条已有可行分配的记录
+（原设备连同其功率、允许相位与原分配）与一批新设备（功率与允许相位），
+保持容量不变，所有新旧设备均须接入各自允许的相位且各相不超容量。目标
+依次为：1) 原设备改相台数最少；2) 再使三相负载最大值与最小值之差最小；
+3) 仍同值时，按全部设备（新旧合并）编号排序取相位序列字典序最小者。
+新旧设备合计至多 12 台。全部设备按编号排序后 DFS、相位按 A/B/C 展开，
+分两遍搜索：第一遍求最小改相台数，第二遍在改相台数固定最小的方案中
+最小化负载差并保留字典序最小方案。
 """
 
 from __future__ import annotations
@@ -864,4 +873,193 @@ def solve_phase_fault_rehearsal(
         disconnected_power=sum(item.power for item in disconnected),
         disconnected_count=len(disconnected),
         choice_sequence=tuple(best_choices),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 新设备接入预演
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DeviceAdditionDevice:
+    """新设备接入预演的输入设备（新旧合并，原设备另记录原接入相位）。"""
+
+    code: str  # 设备唯一编号
+    power: int  # 正整数功率
+    allowed: tuple[str, ...]  # 可接入相位集合（PHASES 的非空子集）
+    original_phase: Optional[str]  # 原设备在记录中的原相位；新设备为 None
+
+
+@dataclass(frozen=True)
+class DeviceAdditionMigration:
+    """一台原设备的改相结果（原相位与新相位不同）。"""
+
+    code: str  # 设备编号
+    power: int  # 设备功率
+    from_phase: str  # 原接入相位
+    to_phase: str  # 新接入相位
+
+
+@dataclass(frozen=True)
+class DeviceAdditionPlanResult:
+    """新设备接入预演结果。feasible 为 False 时其余字段为 None。"""
+
+    feasible: bool
+    assignment: Optional[dict[str, str]]  # 全部设备编号 -> 相位
+    new_codes: frozenset[str]  # 新设备编号集合
+    loads: Optional[dict[str, int]]  # 相位 -> 接入后负载
+    imbalance: Optional[int]  # 接入后三相负载最大值与最小值之差
+    migrated_count: Optional[int]  # 原设备改相台数
+    migrations: Optional[tuple[DeviceAdditionMigration, ...]]  # 改相的原设备（按编号排序）
+
+
+def solve_device_addition_plan(
+    devices: Iterable[DeviceAdditionDevice],
+    capacities: dict[str, int],
+) -> DeviceAdditionPlanResult:
+    """求解新设备接入预演：改相台数最少，其次负载差最小、相位序列字典序最小。
+
+    保持容量不变，所有新旧设备均须接入各自允许的相位且各相不超容量。目标
+    依次为：原设备改相台数（新相位与原相位不同的原设备数）最少 → 三相负载
+    最大值与最小值之差最小 → 按全部设备编号排序的相位序列字典序最小。
+
+    全部设备（新旧合并）按编号排序后 DFS，相位按 A/B/C 顺序展开，故完整
+    方案按相位序列字典序依次产生。分两遍搜索：第一遍最小化改相台数；
+    第二遍在改相台数固定最小的方案中，仅在负载差严格更小时更新最优解，
+    同差值时先枚举到的方案字典序更小。
+
+    :param devices: 新旧设备集合（编号唯一、功率正整数、允许相位非空；
+        原设备的 original_phase 取自其允许集合）。
+    :param capacities: 各相容量，形如 {"A": int, "B": int, "C": int}。
+    :return: DeviceAdditionPlanResult；无可行接入方案时 feasible=False。
+    """
+    new_codes = frozenset(d.code for d in devices if d.original_phase is None)
+    ordered = sorted(devices, key=lambda d: d.code)
+    n = len(ordered)
+    powers = [d.power for d in ordered]
+    # 每个设备的可接入相位按 A/B/C 固定顺序排列，保证 DFS 按字典序枚举方案
+    allowed = [tuple(p for p in PHASES if p in d.allowed) for d in ordered]
+    original_phase = [d.original_phase for d in ordered]
+    is_old = [phase is not None for phase in original_phase]
+    caps = {p: capacities[p] for p in PHASES}
+
+    # suffix_addable[i][p]：第 i..n-1 台设备中可接入相位 p 的功率和（剪枝用）
+    suffix_addable = [{p: 0 for p in PHASES} for _ in range(n + 1)]
+    # suffix_remaining_old[i]：第 i..n-1 台尚未决策的原设备数（改相剪枝用）
+    suffix_remaining_old = [0] * (n + 1)
+    # suffix_total[i]：第 i..n-1 台设备的功率总和（差值下界剪枝用）
+    suffix_total = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        prev, cur = suffix_addable[i + 1], suffix_addable[i]
+        for p in PHASES:
+            cur[p] = prev[p] + (powers[i] if p in allowed[i] else 0)
+        suffix_remaining_old[i] = suffix_remaining_old[i + 1] + (
+            1 if is_old[i] else 0
+        )
+        suffix_total[i] = suffix_total[i + 1] + powers[i]
+
+    loads = {p: 0 for p in PHASES}
+    current: list[Optional[str]] = [None] * n
+
+    # 第一遍：最小化原设备改相台数
+    best_moves: Optional[int] = None
+
+    def dfs_moves(i: int, moves: int) -> None:
+        nonlocal best_moves
+        if best_moves is not None and moves >= best_moves:
+            return  # 改相台数只增不减，不可能再严格更优
+        if i == n:
+            best_moves = moves
+            return
+        for phase in allowed[i]:
+            if loads[phase] + powers[i] <= caps[phase]:
+                extra = 1 if is_old[i] and phase != original_phase[i] else 0
+                loads[phase] += powers[i]
+                current[i] = phase
+                dfs_moves(i + 1, moves + extra)
+                loads[phase] -= powers[i]
+                current[i] = None
+
+    dfs_moves(0, 0)
+    if best_moves is None:
+        return DeviceAdditionPlanResult(
+            feasible=False,
+            assignment=None,
+            new_codes=new_codes,
+            loads=None,
+            imbalance=None,
+            migrated_count=None,
+            migrations=None,
+        )
+
+    target_moves = best_moves
+
+    # 第二遍：在改相台数固定最小的方案中，最小化负载差；
+    # 方案按相位序列字典序依次枚举，仅严格更优才更新，同差值保留先枚举到者
+    best_imbalance: Optional[int] = None
+    best_assignment: Optional[list[str]] = None
+
+    def dfs_best(i: int, moves: int, used: int) -> None:
+        nonlocal best_imbalance, best_assignment
+        if best_imbalance == 0:
+            return  # 已达成理论最优（差值为 0），无需继续搜索
+        if moves > target_moves:
+            return
+        # 即使剩余原设备全部改相也无法把改相台数压回 target_moves
+        if moves + suffix_remaining_old[i] < target_moves:
+            return
+        if i == n:
+            if moves != target_moves:
+                return
+            values = loads.values()
+            imbalance = max(values) - min(values)
+            # 仅严格更优才更新：同差值时先枚举到的方案字典序更小
+            if best_imbalance is None or imbalance < best_imbalance:
+                best_imbalance = imbalance
+                best_assignment = current.copy()
+            return
+        if best_imbalance is not None:
+            # 下界剪枝：
+            #   最终最大负载 >= max(当前最大负载, 总功率平均值上取整)
+            #   最终最小负载 <= min(当前各相负载 + 该相剩余可接入功率)
+            remaining = suffix_total[i]
+            lb_max = max(max(loads.values()), ceil((used + remaining) / 3))
+            ub_min = min(loads[p] + suffix_addable[i][p] for p in PHASES)
+            if lb_max - ub_min >= best_imbalance:
+                return
+        for phase in allowed[i]:
+            if loads[phase] + powers[i] <= caps[phase]:
+                extra = 1 if is_old[i] and phase != original_phase[i] else 0
+                loads[phase] += powers[i]
+                current[i] = phase
+                dfs_best(i + 1, moves + extra, used + powers[i])
+                loads[phase] -= powers[i]
+                current[i] = None
+
+    dfs_best(0, 0, 0)
+
+    assert best_assignment is not None  # 第一遍已找到 target_moves 台改相的可行方案
+    final_loads = {p: 0 for p in PHASES}
+    for idx, phase in enumerate(best_assignment):
+        final_loads[phase] += powers[idx]
+    assignment = {ordered[i].code: best_assignment[i] for i in range(n)}
+    migrations = tuple(
+        DeviceAdditionMigration(
+            code=ordered[i].code,
+            power=powers[i],
+            from_phase=original_phase[i],
+            to_phase=best_assignment[i],
+        )
+        for i in range(n)
+        if is_old[i] and best_assignment[i] != original_phase[i]
+    )
+    return DeviceAdditionPlanResult(
+        feasible=True,
+        assignment=assignment,
+        new_codes=new_codes,
+        loads=final_loads,
+        imbalance=max(final_loads.values()) - min(final_loads.values()),
+        migrated_count=len(migrations),
+        migrations=migrations,
     )

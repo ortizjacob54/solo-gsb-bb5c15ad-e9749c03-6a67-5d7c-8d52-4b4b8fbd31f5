@@ -6,11 +6,13 @@ import unittest
 
 from app.solver import (
     Device,
+    DeviceAdditionDevice,
     FaultRehearsalDevice,
     RobustDevice,
     StartupDevice,
     solve,
     solve_capacity_upgrade,
+    solve_device_addition_plan,
     solve_phase_fault_rehearsal,
     solve_robust,
     solve_startup_plan,
@@ -1159,6 +1161,284 @@ class PhaseFaultRehearsalFuzzTest(unittest.TestCase):
         self.assertEqual(result.disconnected_count, 12)
         self.assertEqual(result.retained_power, 0)
         self.assertEqual(result.choice_sequence, ("D",) * 12)
+
+
+# ---------------------------------------------------------------------------
+# 新设备接入预演
+# ---------------------------------------------------------------------------
+
+
+def brute_force_addition(devices, capacities):
+    """新设备接入预演的朴素全枚举参照实现。
+
+    返回 (改相台数, 负载差, 相位序列, 负载) 或 None（无可行方案）。
+    相位序列按全部设备编号排序。
+    """
+    ordered = sorted(devices, key=lambda d: d.code)
+    allowed = [tuple(p for p in PHASES if p in d.allowed) for d in ordered]
+    best = None
+    for combo in itertools.product(*allowed):
+        loads = {p: 0 for p in PHASES}
+        ok = True
+        for device, phase in zip(ordered, combo):
+            loads[phase] += device.power
+            if loads[phase] > capacities[phase]:
+                ok = False
+                break
+        if not ok:
+            continue
+        moves = sum(
+            1
+            for device, phase in zip(ordered, combo)
+            if device.original_phase is not None and phase != device.original_phase
+        )
+        imbalance = max(loads.values()) - min(loads.values())
+        key = (moves, imbalance, combo)
+        if best is None or key < best[0]:
+            best = (key, dict(loads))
+    return best
+
+
+def _addition_devices_from_specs(specs):
+    """spec 形如 (code, power, allowed, original_phase)。"""
+    return [
+        DeviceAdditionDevice(code, power, tuple(allowed), original)
+        for code, power, allowed, original in specs
+    ]
+
+
+class DeviceAdditionPlanTest(unittest.TestCase):
+    def test_zero_moves_preferred_over_smaller_imbalance(self):
+        # 0 改相方案（N1->C，负载 8/2/2，差 6）；让 O2 改相可得差 3，
+        # 但改相台数最少优先 -> 保留 0 改相
+        specs = [
+            ("O1", 8, PHASES, "A"),
+            ("O2", 2, PHASES, "B"),
+            ("N1", 2, PHASES, None),
+        ]
+        result = solve_device_addition_plan(
+            _addition_devices_from_specs(specs),
+            {"A": 10, "B": 10, "C": 10},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.migrated_count, 0)
+        self.assertEqual(result.migrations, ())
+        self.assertEqual(result.assignment, {"N1": "C", "O1": "A", "O2": "B"})
+        self.assertEqual(result.loads, {"A": 8, "B": 2, "C": 2})
+        self.assertEqual(result.imbalance, 6)
+
+    def test_move_required_minimize_moves(self):
+        # N1 只能接 A 且 0 改相时 A 相超载（8+3>10），必须有一台原设备改相
+        specs = [
+            ("O1", 8, ("A", "B"), "A"),
+            ("O2", 2, PHASES, "B"),
+            ("N1", 3, ("A",), None),
+        ]
+        result = solve_device_addition_plan(
+            _addition_devices_from_specs(specs),
+            {"A": 10, "B": 10, "C": 10},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.migrated_count, 1)
+        # O1->B（序列 (B,B,A)）与 O2->C（序列 (A,C,A)）负载差同为 10，
+        # 按全部设备编号 N1/O1/O2 排序的相位序列字典序取前者
+        self.assertEqual(result.assignment, {"N1": "A", "O1": "B", "O2": "B"})
+        self.assertEqual(result.loads, {"A": 3, "B": 10, "C": 0})
+        self.assertEqual(
+            [(m.code, m.from_phase, m.to_phase) for m in result.migrations],
+            [("O1", "A", "B")],
+        )
+
+    def test_imbalance_optimized_among_minimal_moves(self):
+        # 0 改相可行（N1 放 C：8/2/2，差 6；N1 放 A：10/2/0，差 10；
+        # N1 放 B：8/4/0，差 8）-> 同 0 改相下取差最小的 N1->C
+        specs = [
+            ("O1", 8, ("A",), "A"),
+            ("O2", 2, PHASES, "B"),
+            ("N1", 2, PHASES, None),
+        ]
+        result = solve_device_addition_plan(
+            _addition_devices_from_specs(specs),
+            {"A": 10, "B": 10, "C": 10},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.migrated_count, 0)
+        self.assertEqual(result.imbalance, 6)
+        self.assertEqual(result.assignment["N1"], "C")
+
+    def test_infeasible_capacity(self):
+        # 原设备 9 固定 A；新设备 2 也只能 A，A 容量 10，原设备无法改相
+        specs = [
+            ("O1", 9, ("A",), "A"),
+            ("N1", 2, ("A",), None),
+        ]
+        result = solve_device_addition_plan(
+            _addition_devices_from_specs(specs),
+            {"A": 10, "B": 10, "C": 10},
+        )
+        self.assertFalse(result.feasible)
+        self.assertIsNone(result.assignment)
+        self.assertIsNone(result.loads)
+        self.assertIsNone(result.imbalance)
+        self.assertIsNone(result.migrated_count)
+        self.assertIsNone(result.migrations)
+
+    def test_lexicographic_tie_break(self):
+        # 原设备 0 改相均可行：两台同功率新设备，取编号排序后字典序最小序列
+        specs = [
+            ("O1", 10, PHASES, "A"),
+            ("N2", 5, PHASES, None),
+            ("N1", 5, PHASES, None),
+        ]
+        result = solve_device_addition_plan(
+            _addition_devices_from_specs(specs),
+            {"A": 100, "B": 100, "C": 100},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.migrated_count, 0)
+        # 编号排序 N1,N2,O1：序列 (B,C,A) 负载 (10,5,5) 差 5 为 0 改相下
+        # 最优；(A,B,A) 虽字典序更小但 A=15、差 15，故选前者
+        self.assertEqual(
+            result.assignment, {"N1": "B", "N2": "C", "O1": "A"}
+        )
+        self.assertEqual(result.loads, {"A": 10, "B": 5, "C": 5})
+
+    def test_migrations_sorted_by_code(self):
+        specs = [
+            ("O1", 4, ("A", "B"), "A"),
+            ("O2", 4, ("A", "B"), "A"),
+            ("N1", 9, ("A",), None),
+        ]
+        # A 容量 10：N1(9) 接 A 后两台原设备都须迁出 A
+        result = solve_device_addition_plan(
+            _addition_devices_from_specs(specs),
+            {"A": 10, "B": 10, "C": 10},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.migrated_count, 2)
+        self.assertEqual([m.code for m in result.migrations], ["O1", "O2"])
+        for migration in result.migrations:
+            self.assertEqual(migration.from_phase, "A")
+
+    def test_new_codes_tracked(self):
+        specs = [
+            ("O1", 5, PHASES, "A"),
+            ("N1", 5, PHASES, None),
+        ]
+        result = solve_device_addition_plan(
+            _addition_devices_from_specs(specs),
+            {"A": 100, "B": 100, "C": 100},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.new_codes, frozenset({"N1"}))
+
+
+class DeviceAdditionPlanFuzzTest(unittest.TestCase):
+    """与朴素全枚举参照实现做随机对拍。"""
+
+    def _generate(self, rng):
+        n_old = rng.randint(1, 6)
+        n_new = rng.randint(1, max(1, 8 - n_old))
+        specs = []
+        for i in range(n_old):
+            allowed = tuple(p for p in PHASES if rng.random() < 0.7) or ("A",)
+            specs.append(
+                (f"O{i}", rng.randint(1, 20), allowed, rng.choice(allowed))
+            )
+        for i in range(n_new):
+            allowed = tuple(p for p in PHASES if rng.random() < 0.7) or ("A",)
+            specs.append((f"N{i}", rng.randint(1, 20), allowed, None))
+        devices = _addition_devices_from_specs(specs)
+        # 容量至少容得下原记录的分配（模拟一条可行计算记录），再加随机余量
+        original_loads = {p: 0 for p in PHASES}
+        for code, power, allowed, original in specs:
+            if original is not None:
+                original_loads[original] += power
+        capacities = {
+            p: original_loads[p] + rng.randint(0, 30) for p in PHASES
+        }
+        return devices, capacities
+
+    def test_against_brute_force(self):
+        rng = random.Random(20261001)
+        for case in range(500):
+            devices, capacities = self._generate(rng)
+            expected = brute_force_addition(devices, capacities)
+            result = solve_device_addition_plan(devices, capacities)
+
+            if expected is None:
+                self.assertFalse(result.feasible, f"case {case}: 应为无可行解")
+                continue
+
+            (exp_moves, exp_imbalance, exp_combo), exp_loads = expected
+            self.assertTrue(result.feasible, f"case {case}: 应有可行解")
+            self.assertEqual(
+                result.migrated_count, exp_moves, f"case {case}: 改相台数不符"
+            )
+            self.assertEqual(
+                result.imbalance, exp_imbalance, f"case {case}: 负载差不符"
+            )
+            self.assertEqual(result.loads, exp_loads, f"case {case}: 负载不符")
+            ordered = sorted(devices, key=lambda d: d.code)
+            actual_combo = tuple(result.assignment[d.code] for d in ordered)
+            self.assertEqual(
+                actual_combo, exp_combo, f"case {case}: 字典序最小方案不符"
+            )
+            # 自洽性：改相清单与最终分配、原相位一致
+            for migration in result.migrations:
+                self.assertNotEqual(migration.from_phase, migration.to_phase)
+                self.assertEqual(
+                    result.assignment[migration.code], migration.to_phase
+                )
+            for p in PHASES:
+                self.assertLessEqual(result.loads[p], capacities[p])
+
+    def test_twelve_devices_performance(self):
+        # 12 台合计（6 原 + 6 新）、全相位可接、大容量：枚举规模最大
+        specs = [
+            (f"O{i:02d}", 2 * i + 1, PHASES, ("A" if i % 2 else "B"))
+            for i in range(6)
+        ]
+        specs += [
+            (f"N{i:02d}", 2 * i + 3, PHASES, None) for i in range(6)
+        ]
+        devices = _addition_devices_from_specs(specs)
+        capacities = {"A": 10**6, "B": 10**6, "C": 10**6}
+        result = solve_device_addition_plan(devices, capacities)
+        self.assertTrue(result.feasible)
+        expected = brute_force_addition(devices, capacities)
+        (exp_moves, exp_imbalance, exp_combo), exp_loads = expected
+        self.assertEqual(result.migrated_count, exp_moves)
+        self.assertEqual(result.imbalance, exp_imbalance)
+        self.assertEqual(result.loads, exp_loads)
+        ordered = sorted(devices, key=lambda d: d.code)
+        self.assertEqual(
+            tuple(result.assignment[d.code] for d in ordered), exp_combo
+        )
+
+    def test_twelve_devices_tight_capacity_performance(self):
+        # 紧容量下大量改相 / 不可行分支：求解器仍须快速且自洽
+        specs = [
+            (f"O{i:02d}", i + 1, ("A", "B"), "A") for i in range(6)
+        ]
+        specs += [
+            (f"N{i:02d}", i + 2, ("A", "C"), None) for i in range(6)
+        ]
+        devices = _addition_devices_from_specs(specs)
+        capacities = {"A": 30, "B": 25, "C": 25}
+        result = solve_device_addition_plan(devices, capacities)
+        expected = brute_force_addition(devices, capacities)
+        if expected is None:
+            self.assertFalse(result.feasible)
+        else:
+            (exp_moves, exp_imbalance, exp_combo), exp_loads = expected
+            self.assertEqual(result.migrated_count, exp_moves)
+            self.assertEqual(result.imbalance, exp_imbalance)
+            self.assertEqual(result.loads, exp_loads)
+            ordered = sorted(devices, key=lambda d: d.code)
+            self.assertEqual(
+                tuple(result.assignment[d.code] for d in ordered), exp_combo
+            )
 
 
 if __name__ == "__main__":
