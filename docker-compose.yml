@@ -1,0 +1,16 @@
+services:
+  api:
+    build: .
+    image: phase-balance-api
+    container_name: phase-balance-api
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件路径（位于挂载卷内，容器重建后数据仍在）
+      DATABASE_PATH: /data/app.db
+    volumes:
+      - app-data:/data
+    restart: unless-stopped
+
+volumes:
+  app-data:
