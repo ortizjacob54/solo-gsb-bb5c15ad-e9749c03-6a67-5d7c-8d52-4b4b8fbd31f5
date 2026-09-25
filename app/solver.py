@@ -52,6 +52,17 @@
 展开，故完整方案按选择序列字典序依次产生，仅在 (保留功率, 保留设备数)
 严格更优时更新，同值自然保留字典序最小方案；并以剩余设备功率和 / 数量和
 做乐观上界剪枝。
+
+新增设备接入预演（solve_device_addition）：对已有可行分配的记录提交一批
+新设备（沿用编号、功率与允许相位规则，新旧合计不超过 12 台且编号互不重复），
+保持原容量不变，新旧设备均须接入其允许相位且各相不超容量；原设备可改相
+（迁移），也可保持原相位。目标依次为：1) 改相的原设备台数最少；
+2) 三相负载最大值与最小值之差最小；3) 按全部设备编号排序的相位序列字典序
+最小。搜索结构与 solve 相同：全部设备（新 + 旧）按编号排序后 DFS，相位按
+A/B/C 展开，完整方案按相位序列字典序依次产生；目标键为 (改相台数, 负载差)，
+仅严格更优才更新，同键时先枚举到的方案字典序最小。剪枝：容量约束；改相
+台数超过当前最优即剪（改相台数只增不减）；改相台数持平最优时沿用 solve 的
+负载差下界剪枝（此时改相台数与负载差均不可能再严格更优）。
 """
 
 from __future__ import annotations
@@ -864,4 +875,170 @@ def solve_phase_fault_rehearsal(
         disconnected_power=sum(item.power for item in disconnected),
         disconnected_count=len(disconnected),
         choice_sequence=tuple(best_choices),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 新增设备接入预演
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdditionExistingDevice:
+    """新增设备接入预演中的原设备（沿用可行计算记录的功率、允许相位与原分配）。"""
+
+    code: str  # 设备唯一编号
+    power: int  # 正整数功率
+    allowed: tuple[str, ...]  # 可接入相位集合（PHASES 的非空子集）
+    original_phase: str  # 记录中的原接入相位（A/B/C）
+
+
+@dataclass(frozen=True)
+class AdditionMigration:
+    """一台改相的原设备。"""
+
+    code: str  # 设备编号
+    power: int  # 设备功率
+    from_phase: str  # 原接入相位（A/B/C）
+    to_phase: str  # 新接入相位（A/B/C）
+
+
+@dataclass(frozen=True)
+class AdditionResult:
+    """新增设备接入预演结果。feasible 为 False 时其余字段为 None。"""
+
+    feasible: bool
+    assignment: Optional[dict[str, str]]  # 全部设备（新 + 旧）编号 -> 相位
+    migrations: Optional[tuple[AdditionMigration, ...]]  # 改相的原设备（按编号排序）
+    loads: Optional[dict[str, int]]  # 相位 -> 负载
+    imbalance: Optional[int]  # 最大相负载 - 最小相负载
+    migrated_count: Optional[int]  # 改相的原设备台数
+
+
+def solve_device_addition(
+    existing_devices: Iterable[AdditionExistingDevice],
+    new_devices: Iterable[Device],
+    capacities: dict[str, int],
+) -> AdditionResult:
+    """求解新增设备接入预演。
+
+    保持原容量不变，新旧设备（合计不超过 12 台、编号互不重复）均须接入其
+    允许相位且各相不超容量；原设备可改相（迁移），也可保持原相位。目标
+    依次为：1) 改相的原设备台数最少；2) 三相负载最大值与最小值之差最小；
+    3) 按全部设备编号排序的相位序列字典序最小。
+
+    求解结构（详见模块 docstring）：全部设备（新 + 旧）按编号排序后 DFS，
+    相位按 A/B/C 展开，完整方案按相位序列字典序依次产生；目标键为
+    (改相台数, 负载差)，仅严格更优才更新，同键时先枚举到的方案字典序更小。
+
+    :param existing_devices: 原设备集合（编号唯一、允许相位非空且含原相位）。
+    :param new_devices: 新设备集合（编号唯一且与原设备不重复、允许相位非空）。
+    :param capacities: 各相容量（沿用原记录），形如 {"A": int, "B": int, "C": int}。
+    :return: AdditionResult；无可行分配时 feasible=False。
+    """
+    combined = sorted(
+        [
+            (d.code, d.power, d.allowed, d.original_phase)
+            for d in existing_devices
+        ]
+        + [(d.code, d.power, d.allowed, None) for d in new_devices],
+        key=lambda item: item[0],
+    )
+    n = len(combined)
+    powers = [item[1] for item in combined]
+    # 每个设备的可接入相位按 A/B/C 固定顺序排列，保证 DFS 按字典序枚举方案
+    allowed = [tuple(p for p in PHASES if p in item[2]) for item in combined]
+    # 原设备的原接入相位；新设备为 None（不涉及改相）
+    original: list[Optional[str]] = [item[3] for item in combined]
+    caps = {p: capacities[p] for p in PHASES}
+
+    # suffix_addable[i][p]：第 i..n-1 台设备中可接入相位 p 的功率和（剪枝用）
+    suffix_addable = [{p: 0 for p in PHASES} for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        prev, cur = suffix_addable[i + 1], suffix_addable[i]
+        for p in PHASES:
+            cur[p] = prev[p] + (powers[i] if p in allowed[i] else 0)
+
+    # suffix_total[i]：第 i..n-1 台设备的功率总和
+    suffix_total = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix_total[i] = suffix_total[i + 1] + powers[i]
+
+    loads = {p: 0 for p in PHASES}
+    current: list[Optional[str]] = [None] * n
+    best_migrations: Optional[int] = None
+    best_imbalance: Optional[int] = None
+    best_assignment: Optional[list[str]] = None
+
+    def dfs(i: int, used: int, migrations: int) -> None:
+        nonlocal best_migrations, best_imbalance, best_assignment
+        if best_migrations == 0 and best_imbalance == 0:
+            return  # 已达成理论最优（不改相且差值为 0），无需继续搜索
+        if i == n:
+            values = loads.values()
+            imbalance = max(values) - min(values)
+            # 目标键 (改相台数, 负载差) 仅严格更优才更新：
+            # 同键时先枚举到的方案相位序列字典序更小
+            if best_migrations is None or (migrations, imbalance) < (
+                best_migrations,
+                best_imbalance,
+            ):
+                best_migrations = migrations
+                best_imbalance = imbalance
+                best_assignment = current.copy()
+            return
+        if best_migrations is not None:
+            # 改相台数只增不减：超过当前最优即可剪枝
+            if migrations > best_migrations:
+                return
+            if migrations == best_migrations:
+                # 改相台数持平最优时，子树内只有负载差严格更小才可能更优，
+                # 沿用 solve 的负载差下界剪枝
+                remaining = suffix_total[i]
+                lb_max = max(max(loads.values()), ceil((used + remaining) / 3))
+                ub_min = min(loads[p] + suffix_addable[i][p] for p in PHASES)
+                if lb_max - ub_min >= best_imbalance:
+                    return
+        for phase in allowed[i]:
+            if loads[phase] + powers[i] <= caps[phase]:
+                moved = 1 if original[i] is not None and phase != original[i] else 0
+                loads[phase] += powers[i]
+                current[i] = phase
+                dfs(i + 1, used + powers[i], migrations + moved)
+                loads[phase] -= powers[i]
+                current[i] = None
+
+    dfs(0, 0, 0)
+
+    if best_assignment is None:
+        return AdditionResult(
+            feasible=False,
+            assignment=None,
+            migrations=None,
+            loads=None,
+            imbalance=None,
+            migrated_count=None,
+        )
+
+    final_loads = {p: 0 for p in PHASES}
+    for idx, phase in enumerate(best_assignment):
+        final_loads[phase] += powers[idx]
+    assignment = {combined[i][0]: best_assignment[i] for i in range(n)}
+    migrations = tuple(
+        AdditionMigration(
+            code=combined[i][0],
+            power=powers[i],
+            from_phase=original[i],
+            to_phase=best_assignment[i],
+        )
+        for i in range(n)
+        if original[i] is not None and best_assignment[i] != original[i]
+    )
+    return AdditionResult(
+        feasible=True,
+        assignment=assignment,
+        migrations=migrations,
+        loads=final_loads,
+        imbalance=best_imbalance,
+        migrated_count=len(migrations),
     )

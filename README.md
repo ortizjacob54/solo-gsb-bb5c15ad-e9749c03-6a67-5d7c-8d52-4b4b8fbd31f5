@@ -28,6 +28,12 @@
 在所有应急方案中**先最大化保留设备的总功率，再最大化保留设备数**，同值时取
 相位选择序列字典序最小者。预演同样**不修改历史记录**。
 
+最后，服务还提供**新增设备接入预演**接口：对已有可行分配的记录提交一批
+**新设备**（沿用编号、功率与允许相位规则，且新旧设备总数不超过 12、编号互不
+重复），在**保持原容量**的前提下让新旧设备全部接入且各相不超容量；优化目标
+依次为**原设备改相台数最少**、**三相负载最大值与最小值之差最小**、按全部设备
+编号排序的相位序列**字典序最小**。预演同样**不修改历史记录**。
+
 ## 快速开始（一键启动）
 
 前置条件：已安装 Docker 与 Docker Compose 插件。
@@ -67,6 +73,7 @@ docker compose up --build
 | `POST` | `/api/v1/calculations/{id}/capacity-upgrade` | 为「无可行分配」的记录给出最小扩容建议（原记录不变） |
 | `POST` | `/api/v1/calculations/{id}/startup-plan` | 为「有可行分配」的记录预演负载差峰值最小的安全启动顺序（原记录不变） |
 | `POST` | `/api/v1/calculations/{id}/phase-fault-rehearsal` | 为「有可行分配」的记录预演单相故障下的保供迁移 / 断开方案（原记录不变） |
+| `POST` | `/api/v1/calculations/{id}/device-addition-plan` | 为「有可行分配」的记录预演新增设备接入方案（原设备改相最少，原记录不变） |
 | `POST` | `/api/v1/robust-rehearsals` | 稳健分相预演：设备功率为区间，求任意功率组合下均不超容量的最优分配（不持久化） |
 | `GET` | `/health` | 健康检查 |
 
@@ -480,6 +487,143 @@ curl -X POST "http://localhost:8000/api/v1/calculations/1/phase-fault-rehearsal?
 | `retained_power` / `retained_count` | 保留设备（健康相不动设备 + 迁移设备）的总功率 / 数量 |
 | `disconnected_power` / `disconnected_count` | 断开设备的总功率 / 数量 |
 
+## 新增设备接入预演
+
+`POST /api/v1/calculations/{id}/device-addition-plan` 用于在已有可行分配的记录
+基础上，预演**提交一批新设备**后的整体接入方案。请求体中的新设备沿用与创建
+计算相同的规则（唯一编号、正整数功率、非空可接入相位集合），并额外要求：
+
+- 新设备编号**不得与记录中已有设备重复**；
+- **新旧设备总数不超过 12 台**。
+
+接口**保持原记录容量不变**，要求新旧设备全部接入各自的允许相位且各相不超
+容量；原设备可以**改相（迁移）**，也可以保持原相位。优化目标依次为：
+
+1. **原设备改相台数最少**（`migrated_count`）；
+2. 改相台数相同时，**三相负载最大值与最小值之差最小**（`imbalance`）；
+3. 仍相同时，取按**全部设备（新 + 旧）编号排序**的相位序列**字典序最小**者。
+
+接口**只做预演，不修改历史计算记录**；保持原容量时若不存在全部设备接入的
+可行方案，返回 `feasible: false` 及说明信息。记录不存在返回 `404`；原记录
+无可行分配返回 `409`；新设备编号与记录重复、新旧总数超过 12 台或新设备
+字段不满足规则返回 `422`。
+
+### 请求示例
+
+```bash
+# 先创建一条可行计算记录（D1->A 功率 6，D2->B 功率 4，容量各 10）
+curl -X POST http://localhost:8000/api/v1/calculations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "capacities": {"A": 10, "B": 10, "C": 10},
+    "devices": [
+      {"id": "D1", "power": 6, "allowed_phases": ["A", "B"]},
+      {"id": "D2", "power": 4, "allowed_phases": ["B", "C"]}
+    ]
+  }'
+
+# 再对该记录预演新增一台设备（假设记录 id 为 1）
+curl -X POST http://localhost:8000/api/v1/calculations/1/device-addition-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "devices": [
+      {"id": "N1", "power": 4, "allowed_phases": ["C"]}
+    ]
+  }'
+```
+
+### 响应示例（无需改相）
+
+新设备 `N1` 只能接 C，原设备保持原相位即得最优方案（负载 6/4/4）：
+
+```json
+{
+  "id": 1,
+  "created_at": "2026-09-25T08:00:00.000000+00:00",
+  "capacities": {"A": 10, "B": 10, "C": 10},
+  "feasible": true,
+  "imbalance": 2,
+  "loads": {"A": 6, "B": 4, "C": 4},
+  "migrated_count": 0,
+  "existing_assignments": [
+    {"device_id": "D1", "phase": "A"},
+    {"device_id": "D2", "phase": "B"}
+  ],
+  "new_assignments": [
+    {"device_id": "N1", "phase": "C"}
+  ],
+  "migrations": [],
+  "message": "预演成功：保持原容量不变，已在原设备改相台数最少、三相负载最大值与最小值之差最小、相位序列字典序最小的目标下，找到新旧设备全部接入的分配方案"
+}
+```
+
+### 响应示例（需要改相）
+
+若上例容量收紧为各相 8，新增 `N1`（功率 5，允许 A/B）在原分配下无处可放，
+必须改相一台：最优方案为 `D2` 迁至 C、`N1` 接 B（负载 6/5/4）：
+
+```json
+{
+  "id": 2,
+  "created_at": "2026-09-25T08:05:00.000000+00:00",
+  "capacities": {"A": 8, "B": 8, "C": 8},
+  "feasible": true,
+  "imbalance": 2,
+  "loads": {"A": 6, "B": 5, "C": 4},
+  "migrated_count": 1,
+  "existing_assignments": [
+    {"device_id": "D1", "phase": "A"},
+    {"device_id": "D2", "phase": "C"}
+  ],
+  "new_assignments": [
+    {"device_id": "N1", "phase": "B"}
+  ],
+  "migrations": [
+    {"device_id": "D2", "power": 4, "from_phase": "B", "to_phase": "C"}
+  ],
+  "message": "预演成功：保持原容量不变，已在原设备改相台数最少、三相负载最大值与最小值之差最小、相位序列字典序最小的目标下，找到新旧设备全部接入的分配方案"
+}
+```
+
+### 响应示例（无可行方案）
+
+```json
+{
+  "id": 1,
+  "created_at": "2026-09-25T08:00:00.000000+00:00",
+  "capacities": {"A": 10, "B": 10, "C": 10},
+  "feasible": false,
+  "imbalance": null,
+  "loads": null,
+  "migrated_count": null,
+  "existing_assignments": [],
+  "new_assignments": [],
+  "migrations": [],
+  "message": "无可行分配：保持原容量不变时，不存在新旧设备全部接入且各相不超容量的方案"
+}
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `capacities` | 各相容量（沿用原计算记录，保持不变） |
+| `feasible` | 保持原容量时，是否存在新旧设备全部接入的可行分配 |
+| `migrated_count` | 改相的原设备台数（首要优化目标） |
+| `imbalance` | 三相负载最大值与最小值之差 |
+| `loads` | 各相负载（均不超过原容量） |
+| `existing_assignments` | 原设备分配（按设备编号排序），相位可能与原记录不同 |
+| `new_assignments` | 新设备分配（按设备编号排序） |
+| `migrations` | 改相的原设备清单（按设备编号排序），含功率、原相位与新相位 |
+
+### 输入校验规则
+
+- 新设备数量 **1 ~ 12** 台，编号**唯一**且非空，且**不得与记录中设备重复**；
+- **新旧设备总数不超过 12 台**；
+- 功率为**正整数**；`allowed_phases` 为**非空**数组，元素取自 `A` / `B` / `C`
+  （自动去重）；
+- 记录不存在返回 `404`；原记录 `feasible=false` 返回 `409`。
+
 ## 本地开发
 
 ```bash
@@ -550,3 +694,10 @@ DFS：健康相设备保持原分配，其负载预先计入健康相；每台�
 同值自然保留字典序最小方案。配合「剩余设备全部保留也无法超过当前最优」的功率 /
 数量乐观上界剪枝，12 台设备的最坏情形亦可瞬时完成；全部断开恒可行，故障相负载
 恒为零。
+
+**新增设备接入预演**（`device-addition-plan`）将新旧设备合并后按编号排序做 DFS，
+相位按 A→B→C 展开，完整方案按「全部设备编号排序后的相位序列」字典序依次产生。
+目标键为 `(原设备改相台数, 负载差)`：仅严格更优才更新，同键时先枚举到的方案
+字典序最小。剪枝包括容量约束、「改相台数超过当前最优」剪枝（改相台数只增不减），
+以及改相台数持平最优时沿用主求解器的负载差下界剪枝（此时改相台数与负载差均
+不可能再严格更优）。新旧合计不超过 12 台，最坏情形亦可快速完成。

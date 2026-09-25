@@ -8,12 +8,15 @@ from fastapi import FastAPI, HTTPException, Query, status
 
 from . import db
 from .schemas import (
+    AdditionMigrationItem,
     AssignmentItem,
     CalculationDetail,
     CalculationRequest,
     CalculationResult,
     CalculationSummary,
     CapacityUpgradeResult,
+    DeviceAdditionPlanResult,
+    DeviceAdditionRequest,
     FaultDisconnectedItem,
     FaultMigrationItem,
     Loads,
@@ -26,12 +29,14 @@ from .schemas import (
     StartupStep,
 )
 from .solver import (
+    AdditionExistingDevice,
     Device,
     FaultRehearsalDevice,
     RobustDevice,
     StartupDevice,
     solve,
     solve_capacity_upgrade,
+    solve_device_addition,
     solve_phase_fault_rehearsal,
     solve_robust,
     solve_startup_plan,
@@ -60,6 +65,13 @@ _MESSAGE_FAULT = (
     "预演成功：健康相设备保持原分配，故障相设备在允许健康相不超容量的前提下，"
     "已找到保留总功率最大、再保留设备数最多，且相位选择序列字典序最小的保供方案"
 )
+_MESSAGE_ADDITION_FEASIBLE = (
+    "预演成功：保持原容量不变，已在原设备改相台数最少、三相负载最大值与最小值"
+    "之差最小、相位序列字典序最小的目标下，找到新旧设备全部接入的分配方案"
+)
+_MESSAGE_ADDITION_INFEASIBLE = (
+    "无可行分配：保持原容量不变时，不存在新旧设备全部接入且各相不超容量的方案"
+)
 
 
 @asynccontextmanager
@@ -84,6 +96,10 @@ app = FastAPI(
         "对已有可行分配的计算记录，亦可做单相故障保供预演：指定故障相后，"
         "健康相设备保持原分配，故障相设备迁至允许的健康相或断开，"
         "先最大化保留总功率、再最大化保留设备数（仅预演，不修改历史记录）。"
+        "对已有可行分配的计算记录，还可做新增设备接入预演：提交一批新设备"
+        "（沿用编号、功率与允许相位规则，新旧合计不超过 12 台且编号不重复），"
+        "保持原容量不变，求解全部设备接入且各相不超容量、原设备改相台数最少、"
+        "负载差最小、相位序列字典序最小的方案（仅预演，不修改历史记录）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -463,4 +479,119 @@ def phase_fault_rehearsal(
         disconnected_power=result.disconnected_power,
         disconnected_count=result.disconnected_count,
         message=_MESSAGE_FAULT,
+    )
+
+
+@app.post(
+    "/api/v1/calculations/{calculation_id}/device-addition-plan",
+    response_model=DeviceAdditionPlanResult,
+    tags=["calculations"],
+)
+def device_addition_plan(
+    calculation_id: int, payload: DeviceAdditionRequest
+) -> DeviceAdditionPlanResult:
+    """新增设备接入预演：为已有可行分配的记录规划一批新设备的接入方案。
+
+    沿用记录中的原容量与各设备的编号、功率、允许相位；新设备遵循同样的
+    编号 / 功率 / 允许相位规则，编号不得与记录中已有设备重复，且新旧设备
+    总数不得超过 12 台。保持原容量不变，所有设备（新 + 旧）均须接入且各相
+    不超容量；原设备可改相（迁移），也可保持原相位。目标依次为：原设备
+    改相台数最少 → 三相负载最大值与最小值之差最小 → 按全部设备编号排序的
+    相位序列字典序最小。返回新旧设备分配、原设备迁移清单与各相负载；
+    无可行方案时返回 ``feasible=false``。仅做预演，不修改历史计算记录。
+
+    记录不存在返回 404；原记录无可行分配返回 409；新设备编号与记录重复
+    或新旧设备总数超过 12 台返回 422。
+    """
+    record = db.get_calculation(calculation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"计算记录不存在：id={calculation_id}",
+        )
+    if not record["feasible"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"计算记录无可行分配，无法规划新增设备接入：id={calculation_id}",
+        )
+
+    record_ids = {d["device_id"] for d in record["devices"]}
+    new_ids = {d.id for d in payload.devices}
+    overlap = sorted(record_ids & new_ids)
+    if overlap:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"新设备编号不得与记录中已有设备重复：{', '.join(overlap)}",
+        )
+    if len(record_ids) + len(new_ids) > 12:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"新旧设备总数不得超过 12 台："
+                f"记录已有 {len(record_ids)} 台，新增 {len(new_ids)} 台"
+            ),
+        )
+
+    existing = [
+        AdditionExistingDevice(
+            code=d["device_id"],
+            power=d["power"],
+            allowed=tuple(d["allowed_phases"]),
+            original_phase=d["assigned_phase"],
+        )
+        for d in record["devices"]
+    ]
+    new_devices = [
+        Device(code=d.id, power=d.power, allowed=tuple(d.allowed_phases))
+        for d in payload.devices
+    ]
+    result = solve_device_addition(existing, new_devices, record["capacities"])
+
+    existing_assignments = (
+        [
+            AssignmentItem(
+                device_id=d["device_id"], phase=result.assignment[d["device_id"]]
+            )
+            for d in record["devices"]
+        ]
+        if result.feasible
+        else []
+    )
+    new_assignments = (
+        [
+            AssignmentItem(device_id=code, phase=result.assignment[code])
+            for code in sorted(new_ids)
+        ]
+        if result.feasible
+        else []
+    )
+    migrations = (
+        [
+            AdditionMigrationItem(
+                device_id=item.code,
+                power=item.power,
+                from_phase=item.from_phase,
+                to_phase=item.to_phase,
+            )
+            for item in result.migrations
+        ]
+        if result.feasible
+        else []
+    )
+    return DeviceAdditionPlanResult(
+        id=record["id"],
+        created_at=record["created_at"],
+        capacities=Loads(**record["capacities"]),
+        feasible=result.feasible,
+        imbalance=result.imbalance,
+        loads=Loads(**result.loads) if result.feasible else None,
+        migrated_count=result.migrated_count,
+        existing_assignments=existing_assignments,
+        new_assignments=new_assignments,
+        migrations=migrations,
+        message=(
+            _MESSAGE_ADDITION_FEASIBLE
+            if result.feasible
+            else _MESSAGE_ADDITION_INFEASIBLE
+        ),
     )
